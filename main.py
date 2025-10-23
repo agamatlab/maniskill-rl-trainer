@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,9 +6,9 @@ import mani_skill.envs  # registers environments
 import gymnasium as gym
 from mani_skill.utils.wrappers.gymnasium import CPUGymWrapper
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-env = CPUGymWrapper(gym.make("PickCube-v1", num_env=10))
-obs_dim = env.pbservation_space.shape[0]
+device = torch.device("cpu")
+env = CPUGymWrapper(gym.make("PickCube-v1", num_envs=1))
+obs_dim = env.observation_space.shape[0]
 act_dim = env.action_space.shape[0]
 
 class Policy(nn.Module):
@@ -29,7 +30,7 @@ policy = Policy().to(device)
 optimizer = optim.Adam(policy.parameters(), lr=3e-4)
 gamma = 0.99
 
-for update in range(1000):
+for update in range(10000):
     obs, _ = env.reset()
     log_probs = []
     rewards = []
@@ -43,6 +44,8 @@ for update in range(1000):
 
         obs, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
         rewards.append(torch.as_tensor(reward, dtype=torch.float32, device=device))
+        terminated = bool(np.array(terminated).item())
+        truncated = bool(np.array(truncated).item())
         done = terminated or truncated
 
     returns = []
@@ -52,7 +55,7 @@ for update in range(1000):
         G = r + gamma * G
         returns.insert(0, G.detach())
 
-    retunrs = torch.stack(returns)
+    returns = torch.stack(returns)
     log_probs = torch.stack(log_probs)
     loss = - (log_probs * returns).mean()
 
@@ -61,5 +64,4 @@ for update in range(1000):
     optimizer.step()
 
     if update % 10 == 0:
-        print(f"Update {update}, Return: {retunrs[0].item():.2f}")
-        
+        print(f"Update {update}, Return: {returns[0].item():.2f}")
