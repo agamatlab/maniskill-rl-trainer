@@ -175,17 +175,16 @@ class DictArray(object):
         new_buffer_shape = next(iter(new_dict.values())).shape[:len(shape)]
         return DictArray(new_buffer_shape, None, data_dict=new_dict)
 
-class NatureCNN(nn.Module):
+
+class VisualEncoder(nn.Module):
     def __init__(self, sample_obs):
         super().__init__()
-
-        extractors = {}
 
         self.out_features = 0
         feature_size = 256
         in_channels=sample_obs["rgb"].shape[-1]
         image_size=(sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
-
+        extractors = {}
 
         # here we use a NatureCNN architecture to process images, but any architecture is permissble here
         cnn = nn.Sequential(
@@ -215,12 +214,6 @@ class NatureCNN(nn.Module):
         extractors["rgb"] = nn.Sequential(cnn, fc)
         self.out_features += feature_size
 
-        if "state" in sample_obs:
-            # for state data we simply pass it through a single linear layer
-            state_size = sample_obs["state"].shape[-1]
-            extractors["state"] = nn.Linear(state_size, 256)
-            self.out_features += 256
-
         self.extractors = nn.ModuleDict(extractors)
 
     def forward(self, observations) -> torch.Tensor:
@@ -232,7 +225,65 @@ class NatureCNN(nn.Module):
                 obs = obs.float().permute(0,3,1,2)
                 obs = obs / 255
             encoded_tensor_list.append(extractor(obs))
-        return torch.cat(encoded_tensor_list, dim=1)
+        return encoded_tensor_list[0]
+
+
+class StateEncoder(nn.Module):
+    def __init__(self, sample_obs):
+        super().__init__()
+
+        extractors = {}
+
+        self.out_features = 0
+        feature_size = 256
+
+        if "state" in sample_obs:
+            # for state data we simply pass it through a single linear layer
+            state_size = sample_obs["state"].shape[-1]
+            extractors["state"] = nn.Linear(state_size, 256)
+            self.out_features += 256
+
+            extracted_features = nn.Sequential(
+                    nn.Linear(state_size,256),
+                    nn.ReLU(),
+                    nn.Linear(256,256),
+                    nn.ReLU(),
+                    nn.Linear(256,256),
+                    nn.ReLU(),
+                )
+            extractors["state"] = extracted_features
+
+        self.extractors = nn.ModuleDict(extractors)
+
+    def forward(self, observations) -> torch.Tensor:
+        encoded_tensor_list = []
+        # self.extractors contain nn.Modules that do all the processing.
+        for key, extractor in self.extractors.items():
+            obs = observations[key]
+            encoded_tensor_list.append(extractor(obs))
+        return encoded_tensor_list[0]
+
+
+class NatureCNN(nn.Module):
+    def __init__(self, sample_obs):
+        super().__init__()
+        self.stateEncoder = StateEncoder(sample_obs)
+        self.visualEncoder = VisualEncoder(sample_obs)
+        self.out_features = self.stateEncoder.out_features + self.visualEncoder.out_features
+
+        self.fusion_network = nn.Sequential(
+            nn.Linear(self.out_features, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+        )
+
+    def forward(self, observations) -> torch.Tensor:
+        state_features = self.stateEncoder(observations)
+        visual_features = self.visualEncoder(observations)
+        total_features = torch.cat([state_features, visual_features], dim=-1)
+
+        return self.fusion_network(total_features) 
 
 class Agent(nn.Module):
     def __init__(self, envs, sample_obs):

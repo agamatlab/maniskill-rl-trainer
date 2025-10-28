@@ -1,3 +1,7 @@
 *.zip
 *.md
 !README.md
+*.mp4
+storage/**
+runs/**
+
