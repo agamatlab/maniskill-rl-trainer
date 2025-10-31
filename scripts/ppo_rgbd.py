@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # ManiSkill specific imports
 import mani_skill.envs
-from mani_skill.utils import gym_utils
+from mani_skill.utils import gym_utils, common
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, FlattenRGBDObservationWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
@@ -80,6 +80,8 @@ class Args:
     """the control mode to use for the environment"""
     sim_backend: str = "cpu"
     """the physics backend to use (gpu/physx_cuda for GPU, cpu/physx_cpu for CPU)"""
+    obs_mode: str = "rgb"
+    """observation mode provided by the environment (e.g., rgb, rgbd, state)"""
     anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.8
@@ -111,6 +113,8 @@ class Args:
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
     finite_horizon_gae: bool = False
+    disable_render: bool = False
+    """if toggled, force ManiSkill to skip creating render systems (useful on Mac without Metal/Vulkan)"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -175,6 +179,36 @@ class DictArray(object):
         new_buffer_shape = next(iter(new_dict.values())).shape[:len(shape)]
         return DictArray(new_buffer_shape, None, data_dict=new_dict)
 
+
+class FlattenStateDictWrapper(gym.ObservationWrapper):
+    def __init__(self, env) -> None:
+        super().__init__(env)
+        flat_sample = common.flatten_state_dict(
+            self.base_env._init_raw_obs, use_torch=True, device=self.base_env.device
+        ).float()
+        self.base_env.update_obs_space({"state": flat_sample})
+        shape = tuple(flat_sample.shape)
+        self.observation_space = gym.spaces.Dict(
+            {
+                "state": gym.spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=shape,
+                    dtype=np.float32,
+                )
+            }
+        )
+
+    @property
+    def base_env(self):
+        return self.env.unwrapped
+
+    def observation(self, observation):
+        flat = common.flatten_state_dict(
+            observation, use_torch=True, device=self.base_env.device
+        ).float()
+        return {"state": flat}
+
 class NatureCNN(nn.Module):
     def __init__(self, sample_obs):
         super().__init__()
@@ -183,37 +217,39 @@ class NatureCNN(nn.Module):
 
         self.out_features = 0
         feature_size = 256
-        in_channels=sample_obs["rgb"].shape[-1]
-        image_size=(sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
+        self.has_rgb = "rgb" in sample_obs
+        if self.has_rgb:
+            in_channels=sample_obs["rgb"].shape[-1]
+            image_size=(sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
 
 
-        # here we use a NatureCNN architecture to process images, but any architecture is permissble here
-        cnn = nn.Sequential(
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=32,
-                kernel_size=8,
-                stride=4,
-                padding=0,
-            ),
-            nn.ReLU(),
-            nn.Conv2d(
-                in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0
-            ),
-            nn.ReLU(),
-            nn.Conv2d(
-                in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0
-            ),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
+            # here we use a NatureCNN architecture to process images, but any architecture is permissble here
+            cnn = nn.Sequential(
+                nn.Conv2d(
+                    in_channels=in_channels,
+                    out_channels=32,
+                    kernel_size=8,
+                    stride=4,
+                    padding=0,
+                ),
+                nn.ReLU(),
+                nn.Conv2d(
+                    in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0
+                ),
+                nn.ReLU(),
+                nn.Conv2d(
+                    in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0
+                ),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
 
-        # to easily figure out the dimensions after flattening, we pass a test tensor
-        with torch.no_grad():
-            n_flatten = cnn(sample_obs["rgb"].float().permute(0,3,1,2).cpu()).shape[1]
-            fc = nn.Sequential(nn.Linear(n_flatten, feature_size), nn.ReLU())
-        extractors["rgb"] = nn.Sequential(cnn, fc)
-        self.out_features += feature_size
+            # to easily figure out the dimensions after flattening, we pass a test tensor
+            with torch.no_grad():
+                n_flatten = cnn(sample_obs["rgb"].float().permute(0,3,1,2).cpu()).shape[1]
+                fc = nn.Sequential(nn.Linear(n_flatten, feature_size), nn.ReLU())
+            extractors["rgb"] = nn.Sequential(cnn, fc)
+            self.out_features += feature_size
 
         if "state" in sample_obs:
             # for state data we simply pass it through a single linear layer
@@ -232,6 +268,8 @@ class NatureCNN(nn.Module):
                 obs = obs.float().permute(0,3,1,2)
                 obs = obs / 255
             encoded_tensor_list.append(extractor(obs))
+        if len(encoded_tensor_list) == 1:
+            return encoded_tensor_list[0]
         return torch.cat(encoded_tensor_list, dim=1)
 
 class Agent(nn.Module):
@@ -306,15 +344,23 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    env_kwargs = dict(obs_mode="rgb", render_mode=args.render_mode, sim_backend=args.sim_backend)
+    if args.disable_render:
+        from mani_skill import render as ms_render
+        ms_render.utils.can_render = lambda device: False
+    env_kwargs = dict(obs_mode=args.obs_mode, render_mode=args.render_mode, sim_backend=args.sim_backend)
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
     envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
 
     # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
-    envs = FlattenRGBDObservationWrapper(envs, rgb=True, depth=False, state=args.include_state)
-    eval_envs = FlattenRGBDObservationWrapper(eval_envs, rgb=True, depth=False, state=args.include_state)
+    use_rgb = args.obs_mode in ("rgb", "rgbd")
+    if use_rgb:
+        envs = FlattenRGBDObservationWrapper(envs, rgb=True, depth=False, state=args.include_state)
+        eval_envs = FlattenRGBDObservationWrapper(eval_envs, rgb=True, depth=False, state=args.include_state)
+    else:
+        envs = FlattenStateDictWrapper(envs)
+        eval_envs = FlattenStateDictWrapper(eval_envs)
 
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)

@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # ManiSkill specific imports
 import mani_skill.envs
-from mani_skill.utils import gym_utils
+from mani_skill.utils import gym_utils, common
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, FlattenRGBDObservationWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
@@ -80,6 +80,8 @@ class Args:
     """the control mode to use for the environment"""
     sim_backend: str = "cpu"
     """the physics backend to use (gpu/physx_cuda for GPU, cpu/physx_cpu for CPU)"""
+    obs_mode: str = "rgb"
+    """observation mode provided by the environment (e.g., rgb, rgbd, state)"""
     anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.8
@@ -111,6 +113,10 @@ class Args:
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
     finite_horizon_gae: bool = False
+    skip_eval: bool = False
+    """if toggled, do not create evaluation envs or run evaluation loops"""
+    disable_render: bool = False
+    """if toggled, force ManiSkill to skip creating render systems (useful on Mac without Metal/Vulkan)"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -176,11 +182,45 @@ class DictArray(object):
         return DictArray(new_buffer_shape, None, data_dict=new_dict)
 
 
+class FlattenStateDictWrapper(gym.ObservationWrapper):
+    def __init__(self, env) -> None:
+        super().__init__(env)
+        flat_sample = common.flatten_state_dict(
+            self.base_env._init_raw_obs, use_torch=True, device=self.base_env.device
+        ).float()
+        self.base_env.update_obs_space({"state": flat_sample})
+        shape = tuple(flat_sample.shape)
+        self.observation_space = gym.spaces.Dict(
+            {
+                "state": gym.spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=shape,
+                    dtype=np.float32,
+                )
+            }
+        )
+
+    @property
+    def base_env(self):
+        return self.env.unwrapped
+
+    def observation(self, observation):
+        flat = common.flatten_state_dict(
+            observation, use_torch=True, device=self.base_env.device
+        ).float()
+        return {"state": flat}
+
+
 class VisualEncoder(nn.Module):
     def __init__(self, sample_obs):
         super().__init__()
 
         self.out_features = 0
+        self.extractors = nn.ModuleDict()
+        if "rgb" not in sample_obs:
+            return
+
         feature_size = 256
         in_channels=sample_obs["rgb"].shape[-1]
         image_size=(sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
@@ -217,6 +257,8 @@ class VisualEncoder(nn.Module):
         self.extractors = nn.ModuleDict(extractors)
 
     def forward(self, observations) -> torch.Tensor:
+        if len(self.extractors) == 0:
+            return None
         encoded_tensor_list = []
         # self.extractors contain nn.Modules that do all the processing.
         for key, extractor in self.extractors.items():
@@ -271,19 +313,29 @@ class NatureCNN(nn.Module):
         self.visualEncoder = VisualEncoder(sample_obs)
         self.out_features = self.stateEncoder.out_features + self.visualEncoder.out_features
 
-        self.fusion_network = nn.Sequential(
-            nn.Linear(self.out_features, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-        )
+        self.fusion_network = None
+        if self.visualEncoder.out_features > 0:
+            self.fusion_network = nn.Sequential(
+                nn.Linear(self.out_features, 512),
+                nn.ReLU(),
+                nn.Linear(512, 512),
+                nn.ReLU(),
+            )
 
     def forward(self, observations) -> torch.Tensor:
         state_features = self.stateEncoder(observations)
+        features = [state_features]
         visual_features = self.visualEncoder(observations)
-        total_features = torch.cat([state_features, visual_features], dim=-1)
+        if visual_features is not None:
+            features.append(visual_features)
+        if len(features) == 1:
+            total_features = features[0]
+        else:
+            total_features = torch.cat(features, dim=-1)
 
-        return self.fusion_network(total_features) 
+        if self.fusion_network is not None:
+            return self.fusion_network(total_features)
+        return total_features
 
 class Agent(nn.Module):
     def __init__(self, envs, sample_obs):
@@ -357,20 +409,37 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    env_kwargs = dict(obs_mode="rgb", render_mode=args.render_mode, sim_backend=args.sim_backend)
+    if args.disable_render:
+        from mani_skill import render as ms_render
+        ms_render.utils.can_render = lambda device: False
+    env_kwargs = dict(obs_mode=args.obs_mode, render_mode=args.render_mode, sim_backend=args.sim_backend)
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
-    eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
+    eval_envs = None
+    if not args.skip_eval:
+        eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
     envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
 
     # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
-    envs = FlattenRGBDObservationWrapper(envs, rgb=True, depth=False, state=args.include_state)
-    eval_envs = FlattenRGBDObservationWrapper(eval_envs, rgb=True, depth=False, state=args.include_state)
+    use_rgb = args.obs_mode in ("rgb", "rgbd")
+    if use_rgb:
+        envs = FlattenRGBDObservationWrapper(
+            envs, rgb=True, depth=False, state=args.include_state
+        )
+        if eval_envs is not None:
+            eval_envs = FlattenRGBDObservationWrapper(
+                eval_envs, rgb=True, depth=False, state=args.include_state
+            )
+    else:
+        envs = FlattenStateDictWrapper(envs)
+        if eval_envs is not None:
+            eval_envs = FlattenStateDictWrapper(eval_envs)
 
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
-        eval_envs = FlattenActionSpaceWrapper(eval_envs)
-    if args.capture_video:
+        if eval_envs is not None:
+            eval_envs = FlattenActionSpaceWrapper(eval_envs)
+    if args.capture_video and eval_envs is not None:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
             eval_output_dir = f"{os.path.dirname(args.checkpoint)}/test_videos"
@@ -380,7 +449,8 @@ if __name__ == "__main__":
             envs = RecordEpisode(envs, output_dir=f"runs/{run_name}/train_videos", save_trajectory=False, save_video_trigger=save_video_trigger, max_steps_per_video=args.num_steps, video_fps=30)
         eval_envs = RecordEpisode(eval_envs, output_dir=eval_output_dir, save_trajectory=args.evaluate, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=30)
     envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
-    eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
+    if eval_envs is not None:
+        eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
@@ -391,7 +461,8 @@ if __name__ == "__main__":
             import wandb
             config = vars(args)
             config["env_cfg"] = dict(**env_kwargs, num_envs=args.num_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=args.partial_reset)
-            config["eval_env_cfg"] = dict(**env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=args.partial_reset)
+            if eval_envs is not None:
+                config["eval_env_cfg"] = dict(**env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=args.partial_reset)
             wandb.init(
                 project=args.wandb_project_name,
                 entity=args.wandb_entity,
@@ -423,13 +494,25 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
-    eval_obs, _ = eval_envs.reset(seed=args.seed)
+    if eval_envs is not None:
+        eval_obs, _ = eval_envs.reset(seed=args.seed)
+    else:
+        eval_obs = None
     next_done = torch.zeros(args.num_envs, device=device)
     print(f"####")
     print(f"args.num_iterations={args.num_iterations} args.num_envs={args.num_envs} args.num_eval_envs={args.num_eval_envs}")
     print(f"args.minibatch_size={args.minibatch_size} args.batch_size={args.batch_size} args.update_epochs={args.update_epochs}")
     print(f"####")
     agent = Agent(envs, sample_obs=next_obs).to(device)
+    with torch.no_grad():
+        fusion_out = agent.get_features(next_obs)
+        print(
+            "fusion_sanity_check",
+            fusion_out.shape,
+            torch.isnan(fusion_out).any().item(),
+            fusion_out.min().item(),
+            fusion_out.max().item(),
+        )
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     if args.checkpoint:
@@ -441,7 +524,7 @@ if __name__ == "__main__":
         print(f"Epoch: {iteration}, global_step={global_step}")
         final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
         agent.eval()
-        if iteration % args.eval_freq == 1:
+        if eval_envs is not None and iteration % args.eval_freq == 1:
             print("Evaluating")
             stime = time.perf_counter()
             eval_obs, _ = eval_envs.reset()
